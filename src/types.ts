@@ -5,14 +5,13 @@ export type RequestStatus = 'Submitted' | 'Under review' | 'Approved' | 'Complet
 export type PaymentStatus = 'Paid' | 'Due' | 'Overdue';
 export type AnnouncementAudience = 'All campus' | 'Students' | 'Staff' | 'Engineering';
 
-export type DemoUser = {
+export type CampusUser = {
   id: string;
   name: string;
   initials: string;
   role: UserRole;
   title: string;
   email: string;
-  password: string;
   department: string;
 };
 

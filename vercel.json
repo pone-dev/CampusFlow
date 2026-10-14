@@ -1,5 +1,11 @@
 {
-  "buildCommand": "npm run build",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "buildCommand": "pnpm build",
   "outputDirectory": "dist",
-  "framework": "vite"
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://campusflow-api.onrender.com/api/:path*"
+    }
+  ]
 }

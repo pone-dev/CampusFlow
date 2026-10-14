@@ -1,39 +1,90 @@
-import { FormEvent, useMemo, useState } from 'react';
-import { cloneTables, modules, startingActivity, users } from './data';
-import { authenticate, dataMode, endSession } from './supabase';
-import type { Activity, DemoUser, ModuleKey, TableRow } from './types';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { moduleFields, modules } from './data';
+import { authenticate, createAccount, createRecord, endSession, getRecords, getSession, saveComplaintTracking, updateRecord } from './api';
+import type { Activity, CampusUser, ModuleKey, TableRow } from './types';
 
 type Page = 'dashboard' | ModuleKey;
 type DraftModal = { module: ModuleKey; title: string; hint: string } | null;
+type ComplaintTracking = { reference: string; token: string; saved: boolean } | null;
+type AccountDraft = { name: string; email: string; password: string; role: CampusUser['role']; department: string; programme: string };
 
-const roleLabel = (role: DemoUser['role']) => role === 'administrator' ? 'Administrator' : role === 'staff' ? 'Faculty & staff' : 'Student';
+const roleLabel = (role: CampusUser['role']) => role === 'administrator' ? 'Administrator' : role === 'staff' ? 'Faculty & staff' : 'Student';
 const pageTitle = (page: Page) => page === 'dashboard' ? 'Overview' : modules.find((item) => item.key === page)?.label ?? 'CampusFlow';
 const today = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date());
+const createEmptyTables = (): Record<ModuleKey, TableRow[]> => ({
+  admissions: [],
+  students: [],
+  academics: [],
+  timetable: [],
+  attendance: [],
+  exams: [],
+  staff: [],
+  rooms: [],
+  maintenance: [],
+  assets: [],
+  library: [],
+  transport: [],
+  hostels: [],
+  finance: [],
+  documents: [],
+  complaints: [],
+  announcements: [],
+  events: [],
+  requests: [],
+  analytics: [],
+});
 
 export default function App() {
-  const [user, setUser] = useState<DemoUser | null>(null);
+  const [user, setUser] = useState<CampusUser | null>(null);
   const [page, setPage] = useState<Page>('dashboard');
-  const [tables, setTables] = useState(cloneTables);
-  const [activity, setActivity] = useState<Activity[]>(startingActivity);
+  const [tables, setTables] = useState<Record<ModuleKey, TableRow[]>>(createEmptyTables);
+  const [activity, setActivity] = useState<Activity[]>([]);
   const [search, setSearch] = useState('');
   const [toast, setToast] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [startupError, setStartupError] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [draftModal, setDraftModal] = useState<DraftModal>(null);
   const [draftName, setDraftName] = useState('');
   const [draftStatus, setDraftStatus] = useState('Submitted');
+  const [draftOwnerEmail, setDraftOwnerEmail] = useState('');
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
   const [draftCategory, setDraftCategory] = useState('Safety');
   const [draftPriority, setDraftPriority] = useState('Medium');
-  const [ownedComplaintIds, setOwnedComplaintIds] = useState<Record<string, string[]>>({});
+  const [complaintTracking, setComplaintTracking] = useState<ComplaintTracking>(null);
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [setupToken, setSetupToken] = useState('');
+  const [accountDraft, setAccountDraft] = useState<AccountDraft>({ name: '', email: '', password: '', role: 'student', department: '', programme: '' });
 
   const notify = (message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(''), 2800);
   };
 
+  const restoreSession = async () => {
+    setStartupError('');
+    setLoading(true);
+    try {
+      const account = await getSession();
+      if (!account) return;
+      const records = await getRecords(account, notify);
+      setUser(account);
+      setTables(records);
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : 'Could not connect to CampusFlow.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void restoreSession();
+  }, []);
+
   const signIn = async (email: string, password: string) => {
     const account = await authenticate(email, password);
-    if (!account) return false;
+    const records = await getRecords(account, notify);
+    setTables(records);
     setUser(account);
     setPage('dashboard');
     setSearch('');
@@ -41,101 +92,110 @@ export default function App() {
     return true;
   };
 
-  const updateRow = (module: ModuleKey, id: string, changes: Record<string, string>) => {
-    setTables((current) => ({
-      ...current,
-      [module]: current[module].map((row) => row.id === id ? { ...row, ...changes } : row),
+  const signOut = async () => {
+    try {
+      await endSession();
+      setUser(null);
+      setTables(createEmptyTables());
+      setSetupToken('');
+      setAccountModalOpen(false);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not sign out.');
+    }
+  };
+
+  const updateRow = async (module: ModuleKey, id: string, changes: Record<string, string>) => {
+    const current = tables[module].find((row) => row.id === id);
+    if (!current) throw new Error('This record is no longer available. Refresh the page and try again.');
+    const payload = Object.fromEntries(Object.entries(current).filter(([key]) => key !== 'id'));
+    const record = await updateRecord(module, id, { ...payload, ...changes });
+    setTables((currentTables) => ({
+      ...currentTables,
+      [module]: currentTables[module].map((row) => row.id === id ? record : row),
     }));
   };
 
   const pushActivity = (title: string, detail: string, tone: Activity['tone'] = 'green') => {
-    setActivity((current) => [{ id: `act-${Date.now()}`, title, detail, time: 'Just now', tone }, ...current].slice(0, 5));
+    setActivity((current) => [{ id: crypto.randomUUID(), title, detail, time: 'Just now', tone }, ...current].slice(0, 5));
   };
 
-  const publish = (title: string, audience = 'Students') => {
+  const publish = async (title: string, audience = 'Students') => {
+    const { record } = await createRecord('announcements', { Title: title, Audience: audience, Published: 'Just now', Status: 'Unread' });
     setTables((current) => ({
       ...current,
-      announcements: [{ id: `n-${Date.now()}`, Title: title, Audience: audience, Published: 'Just now', Status: 'Unread' }, ...current.announcements],
+      announcements: [record, ...current.announcements],
     }));
   };
 
-  const resolveClash = () => {
-    updateRow('timetable', 't2', { Room: 'Innovation Lab', Status: 'Rescheduled' });
-    publish('CS240 moved to Innovation Lab - Monday 09:00', 'CS240 students');
-    pushActivity('Timetable conflict resolved', 'CS240 was moved to Innovation Lab and students were notified.', 'green');
+  const resolveClash = async () => {
+    const clash = tables.timetable.find((row) => row.Status?.toLowerCase().includes('conflict'));
+    if (!clash) {
+      notify('There are no unresolved timetable conflicts.');
+      return;
+    }
+    await updateRow('timetable', clash.id, { Room: 'Innovation Lab', Status: 'Rescheduled' });
+    await publish(`${clash.Course ?? 'A class'} moved to Innovation Lab`, 'Affected students');
+    pushActivity('Timetable conflict resolved', 'The timetable record was updated and an announcement was published.', 'green');
     notify('Conflict resolved. Affected students were notified.');
   };
 
-  const progressTicket = () => {
-    const ticket = tables.maintenance.find((row) => row.id === 'm1');
-    if (!ticket) return;
-    const next = ticket.Status === 'Assigned' ? 'In progress' : 'Resolved';
-    updateRow('maintenance', 'm1', { Status: next });
-    if (next === 'Resolved') {
-      publish('Science 104 projector restored - normal timetable resumes', 'CS210 students');
-      pushActivity('Science 104 maintenance resolved', 'The projector is working again and the room is ready for classes.', 'green');
-    }
-    notify(`Maintenance ticket marked ${next.toLowerCase()}.`);
-  };
-
-  const markAttendance = () => {
-    updateRow('attendance', 'at1', { Present: '27 / 31', Percentage: '87%', Signal: 'On track' });
-    pushActivity('CS210 attendance saved', 'The class register was recorded and student attendance has refreshed.', 'green');
-    notify('CS210 attendance saved for today.');
-  };
-
-  const payInvoice = () => {
-    updateRow('finance', 'f1', { Status: 'Paid' });
-    pushActivity('Fee payment recorded', "Jordan Davis' Fall invoice is now marked paid.", 'green');
-    notify('Demo payment complete. Receipt is now available.');
-  };
-
-  const bookRoom = () => {
-    const room = tables.rooms.find((row) => row.id === 'r3');
-    if (!room || room.Status !== 'Available') {
-      notify('Library 2F is already booked.');
+  const progressTicket = async () => {
+    const ticket = tables.maintenance.find((row) => row.Status !== 'Resolved');
+    if (!ticket) {
+      notify('There are no open maintenance tickets.');
       return;
     }
-    updateRow('rooms', 'r3', { Availability: 'Booked 15:00-16:00', Status: 'Booked' });
-    pushActivity('Library 2F reservation created', 'The room is held for Jordan Davis from 15:00 to 16:00.', 'green');
-    notify('Library 2F is booked for 15:00-16:00.');
+    const next = ticket.Status === 'New' ? 'Assigned' : ticket.Status === 'Assigned' ? 'In progress' : 'Resolved';
+    await updateRow('maintenance', ticket.id, { Status: next });
+    if (next === 'Resolved') {
+      await publish(`${ticket.Issue ?? 'Maintenance issue'} resolved`, 'Affected students');
+      pushActivity('Maintenance issue resolved', `${ticket.Issue ?? 'The issue'} was marked resolved.`, 'green');
+    }
+    notify(`Maintenance ticket marked ${next.toLowerCase()}.`);
   };
 
   const openDraft = (module: ModuleKey, title: string, hint: string, status = 'Submitted') => {
     setDraftName('');
     setDraftStatus(status);
-    setDraftValues(Object.fromEntries(Object.keys(tables[module][0] ?? {}).filter((key) => key !== 'id' && key !== 'Status').map((key) => [key, ''])));
+    setDraftOwnerEmail('');
+    setDraftValues(Object.fromEntries(moduleFields[module].filter((key) => key !== 'Status').map((key) => [key, ''])));
     setDraftCategory('Safety');
     setDraftPriority('Medium');
     setDraftModal({ module, title, hint });
   };
 
-  const addRecord = (event: FormEvent) => {
+  const addRecord = async (event: FormEvent) => {
     event.preventDefault();
     if (!draftModal || !draftName.trim()) return;
 
-    const id = `${draftModal.module}-${Date.now()}`;
-    let record: TableRow;
+    let payload: Record<string, string>;
 
     if (draftModal.module === 'complaints') {
-      record = {
-        id,
-        'Case reference': `CF-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+      payload = {
         Category: draftCategory,
         Summary: draftName.trim(),
         Priority: draftPriority,
         Status: 'Submitted',
       };
-      setOwnedComplaintIds((current) => ({ ...current, [user?.id ?? 'demo']: [...(current[user?.id ?? 'demo'] ?? []), id] }));
     } else {
-      const rows = tables[draftModal.module];
-      const headers = rows.length ? Object.keys(rows[0]).filter((key) => key !== 'id') : ['Item', 'Status'];
-      record = { id };
+      const headers = moduleFields[draftModal.module];
+      payload = {};
       headers.forEach((header, index) => {
-        record[header] = header === 'Status' ? draftStatus : index === 0 ? draftName.trim() : draftValues[header]?.trim() ?? '';
+        payload[header] = header === 'Status' ? draftStatus : index === 0 ? draftName.trim() : draftValues[header]?.trim() ?? '';
       });
     }
 
+    const { record, trackingToken } = await createRecord(draftModal.module, payload, draftOwnerEmail);
+    let trackingSaved = false;
+    if (trackingToken && user) {
+      try {
+        saveComplaintTracking(record.id, trackingToken, user.id);
+        trackingSaved = true;
+      } catch (error) {
+        console.error('Could not save the anonymous complaint tracking key in this browser.', error);
+        trackingSaved = false;
+      }
+    }
     setTables((current) => ({
       ...current,
       [draftModal.module]: [record, ...current[draftModal.module]],
@@ -143,8 +203,44 @@ export default function App() {
 
     pushActivity(`${draftModal.title} added`, draftModal.module === 'complaints' ? 'An anonymous report was submitted for confidential review.' : `${draftName.trim()} was saved in ${pageTitle(draftModal.module)}.`, 'blue');
     setDraftModal(null);
-    notify(`${draftModal.title} saved.`);
+    if (trackingToken) {
+      setComplaintTracking({ reference: record['Case reference'], token: trackingToken, saved: trackingSaved });
+    } else {
+      notify(`${draftModal.title} saved.`);
+    }
   };
+
+  const runAction = async (action: () => Promise<void>) => {
+    try {
+      await action();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The action could not be completed.');
+    }
+  };
+
+  const addAccount = async (event: FormEvent) => {
+    event.preventDefault();
+    const { user: account } = await createAccount(setupToken, accountDraft);
+    pushActivity('Campus account created', `${account.role} account created for ${account.email}.`, 'blue');
+    setAccountDraft({ name: '', email: '', password: '', role: 'student', department: '', programme: '' });
+    notify(`Account created for ${account.email}.`);
+  };
+
+  if (loading) {
+    return <div className="login-page"><section className="login-panel"><h2>Connecting to CampusFlow…</h2></section></div>;
+  }
+
+  if (startupError) {
+    return (
+      <div className="login-page">
+        <section className="login-panel">
+          <h2>CampusFlow could not connect</h2>
+          <p>{startupError}</p>
+          <button className="primary full" onClick={() => void restoreSession()}>Retry connection</button>
+        </section>
+      </div>
+    );
+  }
 
   if (!user) {
     return <Login onSignIn={signIn} />;
@@ -153,6 +249,11 @@ export default function App() {
   const allowedModules = modules.filter((item) => item.roles.includes(user.role));
   const groups = Array.from(new Set(allowedModules.map((item) => item.group)));
   const selected = page === 'dashboard' ? null : modules.find((item) => item.key === page) ?? null;
+  const attentionCount = [
+    ...tables.timetable.filter((row) => row.Status?.toLowerCase().includes('conflict')),
+    ...tables.maintenance.filter((row) => row.Status !== 'Resolved'),
+    ...tables.requests.filter((row) => !['Completed', 'Resolved'].includes(row.Status ?? '')),
+  ].length;
 
   return (
     <div className="app-shell">
@@ -164,8 +265,8 @@ export default function App() {
 
         <div className="university-card">
           <small>UNIVERSITY WORKSPACE</small>
-          <b>Northbridge University</b>
-          <span>Fall term 2026</span>
+          <b>University workspace</b>
+          <span>Current academic term</span>
         </div>
 
         <nav className="nav" aria-label="CampusFlow navigation">
@@ -191,7 +292,7 @@ export default function App() {
             <b>{user.name}</b>
             <small>{roleLabel(user.role)}</small>
           </div>
-          <button className="signout" onClick={() => { void endSession(); setUser(null); }} title="Sign out">?</button>
+          <button className="signout" onClick={() => { void signOut(); }} title="Sign out">?</button>
         </div>
       </aside>
 
@@ -202,9 +303,9 @@ export default function App() {
           <button className="menu-button" onClick={() => setSidebarOpen(true)}>?</button>
           <div className="breadcrumb">Workspace <span>/</span> <b>{pageTitle(page)}</b></div>
           <div className="top-actions">
-            <span className="mode"><i />{dataMode}</span>
+            <span className="mode"><i />MySQL-backed workspace</span>
             <span className="date">{today}</span>
-            <button className="notification" onClick={() => notify('Three items need attention: a clash, a ticket, and a service request.')}>?<i /></button>
+            <button className="notification" onClick={() => notify(`${attentionCount} item${attentionCount === 1 ? '' : 's'} need attention.`)}>?<i /></button>
           </div>
         </header>
 
@@ -232,8 +333,8 @@ export default function App() {
             tables={tables}
             activity={activity}
             navigate={setPage}
-            resolveClash={resolveClash}
-            progressTicket={progressTicket}
+            resolveClash={() => { void runAction(resolveClash); }}
+            progressTicket={() => { void runAction(progressTicket); }}
           />
         ) : selected && (
           <ModulePage
@@ -242,18 +343,30 @@ export default function App() {
             tables={tables}
             search={search}
             setSearch={setSearch}
-            resolveClash={resolveClash}
-            progressTicket={progressTicket}
-            markAttendance={markAttendance}
-            payInvoice={payInvoice}
-            bookRoom={bookRoom}
+            resolveClash={() => { void runAction(resolveClash); }}
+            progressTicket={() => { void runAction(progressTicket); }}
             openDraft={openDraft}
             updateRow={updateRow}
+            runAction={runAction}
             notify={notify}
-            ownedComplaintIds={ownedComplaintIds[user.id] ?? []}
           />
         )}
       </main>
+
+      {user.role === 'administrator' && page === 'students' && (
+        <button className="account-create-fab" onClick={() => setAccountModalOpen(true)}>+ Create campus account</button>
+      )}
+
+      {accountModalOpen && (
+        <AccountForm
+          account={accountDraft}
+          setAccount={setAccountDraft}
+          setupToken={setupToken}
+          setSetupToken={setSetupToken}
+          onClose={() => { setAccountModalOpen(false); setSetupToken(''); }}
+          onSubmit={(event) => { void runAction(() => addAccount(event)); }}
+        />
+      )}
 
       {draftModal && (
         <DraftForm
@@ -262,7 +375,11 @@ export default function App() {
           status={draftStatus}
           setName={setDraftName}
           setStatus={setDraftStatus}
-          fields={Object.keys(tables[draftModal.module][0] ?? {}).filter((key) => key !== 'id' && key !== 'Status')}
+          ownerEmail={draftOwnerEmail}
+          setOwnerEmail={setDraftOwnerEmail}
+          canAssignOwner={['administrator', 'staff'].includes(user.role) && ['attendance', 'exams', 'finance', 'documents', 'requests', 'hostels', 'library'].includes(draftModal.module)}
+          ownerRequired={user.role !== 'student' && ['attendance', 'exams', 'finance', 'documents', 'requests', 'hostels', 'library'].includes(draftModal.module)}
+          fields={moduleFields[draftModal.module].filter((key) => key !== 'Status')}
           values={draftValues}
           setValues={setDraftValues}
           category={draftCategory}
@@ -270,8 +387,32 @@ export default function App() {
           setCategory={setDraftCategory}
           setPriority={setDraftPriority}
           onClose={() => setDraftModal(null)}
-          onSubmit={addRecord}
+          onSubmit={(event) => { void runAction(() => addRecord(event)); }}
         />
+      )}
+
+      {complaintTracking && (
+        <div className="modal-backdrop">
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="complaint-tracking-title">
+            <span className="eyebrow">Anonymous report submitted</span>
+            <h2 id="complaint-tracking-title">Save your case details</h2>
+            <p>Your report is not linked to your account. Keep this private key to track its status later.</p>
+            <label>
+              Case reference
+              <input readOnly value={complaintTracking.reference} />
+            </label>
+            <label>
+              Private tracking key
+              <input readOnly value={complaintTracking.token} />
+            </label>
+            <small>{complaintTracking.saved
+              ? 'The tracking key is also saved in this browser for your convenience.'
+              : 'This browser could not save the key. Copy it now; it cannot be recovered if lost.'}</small>
+            <div className="modal-actions">
+              <button className="primary" onClick={() => setComplaintTracking(null)}>Done</button>
+            </div>
+          </section>
+        </div>
       )}
 
       <div className={`toast ${toast ? 'show' : ''}`}>{toast}</div>
@@ -286,8 +427,12 @@ function Login({ onSignIn }: { onSignIn: (email: string, password: string) => Pr
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const signedIn = await onSignIn(email, password);
-    if (!signedIn) setError('Use one of the demo account email and password pairs below.');
+    setError('');
+    try {
+      await onSignIn(email, password);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'Sign in failed. Please try again.');
+    }
   };
 
   return (
@@ -306,72 +451,87 @@ function Login({ onSignIn }: { onSignIn: (email: string, password: string) => Pr
 
       <section className="login-panel">
         <div>
-          <span className="eyebrow">Demo access</span>
+          <span className="eyebrow">Secure workspace</span>
           <h2>Sign in to CampusFlow</h2>
-          <p>Use a separate account to see each university role.</p>
+          <p>Sign in with the account provisioned by your university administrator.</p>
         </div>
 
         <form onSubmit={submit}>
           <label>
             Email
-            <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@campusflow.demo" type="email" />
+            <input required autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@university.edu" type="email" />
           </label>
           <label>
             Password
-            <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" />
+            <input required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" />
           </label>
 
           {error && <div className="form-error">{error}</div>}
           <button className="primary full" type="submit">Sign in</button>
         </form>
 
-        <div className="demo-accounts">
-          {users.map((account) => (
-            <button key={account.id} onClick={() => { setEmail(account.email); setPassword(account.password); setError(''); }}>
-              <span className="avatar">{account.initials}</span>
-              <span>
-                <b>{roleLabel(account.role)}</b>
-                <small>{account.email} | {account.password}</small>
-              </span>
-              <em>Use</em>
-            </button>
-          ))}
-        </div>
-
-        <small className="demo-note">This app starts in seeded demo mode until Supabase credentials are added.</small>
+        <small className="demo-note">Accounts are created by an authorized CampusFlow administrator.</small>
       </section>
     </div>
   );
 }
 
 function Dashboard({ user, tables, activity, navigate, resolveClash, progressTicket }: {
-  user: DemoUser;
+  user: CampusUser;
   tables: Record<ModuleKey, TableRow[]>;
   activity: Activity[];
   navigate: (page: Page) => void;
   resolveClash: () => void;
   progressTicket: () => void;
 }) {
+  const clashes = tables.timetable.filter((row) => row.Status?.toLowerCase().includes('conflict'));
+  const openMaintenance = tables.maintenance.filter((row) => row.Status !== 'Resolved');
+  const openRequests = tables.requests.filter((row) => !['Completed', 'Resolved'].includes(row.Status ?? ''));
+  const studentAttendance = user.role === 'student' ? tables.attendance[0] : tables.attendance.find((row) => row.Student === user.name);
+  const openInvoices = tables.finance.filter((row) => row.Status !== 'Paid');
   const stats = user.role === 'administrator'
     ? [
-        ['Active students', '6,842', '+4.8%'],
-        ['Open maintenance', String(tables.maintenance.filter((row) => row.Status !== 'Resolved').length), '4 high priority'],
-        ['Timetable clashes', String(tables.timetable.filter((row) => row.Status === 'Room conflict').length), 'Needs action'],
-        ['Fees due', '$84.2K', '18 Oct deadline'],
+        ['Student records', String(tables.students.length), 'Current records'],
+        ['Open maintenance', String(openMaintenance.length), 'Needs attention'],
+        ['Timetable clashes', String(clashes.length), 'Needs action'],
+        ['Invoices due', String(openInvoices.length), 'Unpaid records'],
       ]
     : user.role === 'staff'
       ? [
-          ['Classes today', '3', 'CS210 at 09:00'],
-          ['Registers due', '1', 'Data Structures'],
-          ['Open tickets', String(tables.maintenance.filter((row) => row.Status !== 'Resolved').length), 'Science 104 urgent'],
-          ['Student requests', '2', 'Awaiting response'],
+          ['Scheduled classes', String(tables.timetable.length), 'Current records'],
+          ['Attendance records', String(tables.attendance.length), 'Available registers'],
+          ['Open tickets', String(openMaintenance.length), 'Needs attention'],
+          ['Student requests', String(openRequests.length), 'Awaiting response'],
         ]
       : [
-          ['Classes today', '4', 'Next: CS210'],
-          ['My attendance', '87%', 'On track'],
-          ['Fee balance', tables.finance.find((row) => row.Student === 'Jordan Davis')?.Status === 'Paid' ? '$0' : '$1,250', 'Due 18 Oct'],
-          ['Open requests', String(tables.requests.filter((row) => row['Submitted by'] === 'Jordan Davis').length), 'Registrar review'],
+          ['Scheduled classes', String(tables.timetable.length), 'Current records'],
+          ['My attendance', studentAttendance?.Percentage ?? '—', studentAttendance?.Signal ?? 'No attendance record'],
+          ['Open invoices', String(openInvoices.length), 'Unpaid records'],
+          ['Open requests', String(openRequests.length), 'Awaiting response'],
         ];
+  const priorityItems = [
+    ...(clashes.length ? [{
+      title: clashes[0].Course ?? 'Timetable conflict',
+      detail: `${clashes[0].Day ?? 'Schedule'} ${clashes[0].Time ?? ''} · ${clashes[0].Room ?? 'Room not set'}`,
+      page: 'timetable' as Page,
+      action: user.role === 'administrator' ? 'Resolve clash' : 'View timetable',
+      run: user.role === 'administrator' ? resolveClash : () => navigate('timetable'),
+    }] : []),
+    ...(openMaintenance.length ? [{
+      title: openMaintenance[0].Issue ?? 'Open maintenance ticket',
+      detail: `${openMaintenance[0].Location ?? 'Location not set'} · ${openMaintenance[0].Status ?? 'Open'}`,
+      page: 'maintenance' as Page,
+      action: user.role === 'student' ? 'View updates' : 'Update ticket',
+      run: user.role === 'student' ? () => navigate('announcements') : progressTicket,
+    }] : []),
+    ...(openRequests.length ? [{
+      title: openRequests[0].Request ?? 'Student service request',
+      detail: `${openRequests[0].Team ?? 'Service desk'} · ${openRequests[0].Status ?? 'Open'}`,
+      page: 'requests' as Page,
+      action: 'Open desk',
+      run: () => navigate('requests'),
+    }] : []),
+  ];
 
   const quickCards = [
     { title: 'Academic management', copy: 'Track courses, attendance and timetable health in one place.', icon: '?', page: 'academics' as Page },
@@ -396,39 +556,23 @@ function Dashboard({ user, tables, activity, navigate, resolveClash, progressTic
         <article className="card priority-card">
           <div className="section-heading">
             <div>
-              <span className="eyebrow">Live operations</span>
+              <span className="eyebrow">Current records</span>
               <h2>Priority work center</h2>
             </div>
             <button className="text-button" onClick={() => navigate('analytics')}>View reports ?</button>
           </div>
 
           <div className="priority-list">
-            <div className="priority-item">
-              <span className="priority-icon conflict">!</span>
-              <section>
-                <b>CS240 has a room conflict</b>
-                <p>Science 104 is assigned to two Monday 09:00 classes.</p>
-              </section>
-              {user.role === 'administrator' ? <button className="secondary" onClick={resolveClash}>Resolve clash</button> : <button className="secondary" onClick={() => navigate('timetable')}>View timetable</button>}
-            </div>
-
-            <div className="priority-item">
-              <span className="priority-icon repair">?</span>
-              <section>
-                <b>Projector issue in Science 104</b>
-                <p>Facilities is assigned before the next teaching block.</p>
-              </section>
-              {user.role === 'student' ? <button className="secondary" onClick={() => navigate('announcements')}>View update</button> : <button className="secondary" onClick={progressTicket}>Update ticket</button>}
-            </div>
-
-            <div className="priority-item">
-              <span className="priority-icon request">?</span>
-              <section>
-                <b>Student support requests need review</b>
-                <p>One transcript and one IT service request are in progress.</p>
-              </section>
-              <button className="secondary" onClick={() => navigate('requests')}>Open desk</button>
-            </div>
+            {priorityItems.length ? priorityItems.map((item) => (
+              <div className="priority-item" key={item.page}>
+                <span className="priority-icon conflict">!</span>
+                <section>
+                  <b>{item.title}</b>
+                  <p>{item.detail}</p>
+                </section>
+                <button className="secondary" onClick={item.run}>{item.action}</button>
+              </div>
+            )) : <p className="empty-state">No priority work is currently recorded.</p>}
           </div>
         </article>
 
@@ -436,7 +580,7 @@ function Dashboard({ user, tables, activity, navigate, resolveClash, progressTic
       </section>
 
       <section className="quick-grid">
-        {quickCards.map((card) => (
+        {quickCards.filter((card) => modules.find((item) => item.key === card.page)?.roles.includes(user.role)).map((card) => (
           <QuickCard
             key={card.title}
             title={card.title}
@@ -450,7 +594,7 @@ function Dashboard({ user, tables, activity, navigate, resolveClash, progressTic
       <section className="card activity-panel">
         <div className="section-heading">
           <div>
-            <span className="eyebrow">Audit trail</span>
+            <span className="eyebrow">This session</span>
             <h2>Recent activity</h2>
           </div>
         </div>
@@ -466,18 +610,19 @@ function Dashboard({ user, tables, activity, navigate, resolveClash, progressTic
               <small>{item.time}</small>
             </div>
           ))}
+          {!activity.length && <p className="empty-state">New actions in this session will appear here.</p>}
         </div>
       </section>
     </>
   );
 }
 
-function CampusAssistant({ user, tables }: { user: DemoUser; tables: Record<ModuleKey, TableRow[]> }) {
+function CampusAssistant({ user, tables }: { user: CampusUser; tables: Record<ModuleKey, TableRow[]> }) {
   const prompts = [
-    'Where can the CS240 class be moved?',
-    'How is attendance looking in CS210?',
+    'Are there any timetable conflicts?',
+    'How is my attendance?',
     'Is there anything urgent in facilities?',
-    'What is the billing status for Jordan Davis?',
+    'What is my invoice status?',
   ];
 
   const [question, setQuestion] = useState(prompts[0]);
@@ -513,32 +658,42 @@ function CampusAssistant({ user, tables }: { user: DemoUser; tables: Record<Modu
   );
 }
 
-function getAssistantAnswer(question: string, tables: Record<ModuleKey, TableRow[]>, user: DemoUser) {
+function getAssistantAnswer(question: string, tables: Record<ModuleKey, TableRow[]>, user: CampusUser) {
   const q = question.toLowerCase();
 
-  if (q.includes('cs240') || q.includes('room') || q.includes('move')) {
-    return 'The best option is to move CS240 to Innovation Lab on Monday 09:00. That room is free and avoids the conflict with Science 104 while keeping the timetable disruption low.';
+  if (q.includes('timetable') || q.includes('room') || q.includes('move')) {
+    const conflict = tables.timetable.find((row) => row.Status?.toLowerCase().includes('conflict'));
+    return conflict
+      ? `${conflict.Course ?? 'A class'} has an unresolved conflict at ${conflict.Room ?? 'an assigned room'}. Review the timetable before changing the schedule.`
+      : 'No unresolved timetable conflicts are present in the records available to your account.';
   }
 
   if (q.includes('attendance') || q.includes('cs210')) {
-    return 'The current attendance trend for CS210 is healthy: Jordan Davis is at 87%, and the support threshold remains above the 75% campus safety line. Faculty can intervene early if attendance drops below the risk band.';
+    const attendance = tables.attendance;
+    return attendance.length
+      ? `There are ${attendance.length} attendance record${attendance.length === 1 ? '' : 's'} available to your account. Check the Attendance module for details.`
+      : 'No attendance records are currently available to your account.';
   }
 
   if (q.includes('facility') || q.includes('maintenance') || q.includes('urgent')) {
-    return 'Science 104 has a high-priority projector issue assigned to facilities. The current fix path is to resolve the ticket, confirm room readiness, and notify teaching staff before the next lecture block.';
+    const ticket = tables.maintenance.find((row) => row.Status !== 'Resolved');
+    return ticket
+      ? `${ticket.Issue ?? 'A maintenance issue'} is ${ticket.Status ?? 'open'}${ticket.Location ? ` at ${ticket.Location}` : ''}.`
+      : 'No open maintenance tickets are present in the records available to your account.';
   }
 
-  if (q.includes('billing') || q.includes('fee') || q.includes('payment') || q.includes('jordan')) {
-    const record = tables.finance.find((row) => row.Student === 'Jordan Davis');
-    if (record?.Status === 'Paid') return 'Jordan Davis has already paid the Fall invoice. The account is in good standing and no further action is needed.';
-    return 'Jordan Davis currently has a $1,250 fee due on 18 Oct. The payment reminder is active, and the system is tracking a payment follow-up for the student records team.';
+  if (q.includes('billing') || q.includes('fee') || q.includes('payment') || q.includes('invoice')) {
+    const invoices = tables.finance;
+    if (!invoices.length) return 'No invoice records are currently available to your account.';
+    const due = invoices.filter((row) => row.Status !== 'Paid').length;
+    return `${invoices.length} invoice record${invoices.length === 1 ? '' : 's'} available; ${due} unpaid. Payment processing is not configured.`;
   }
 
   if (user.role === 'student') {
-    return 'CampusFlow recommends checking your timetable, attendance, and service requests before the next teaching day so you can act early on any disruptions.';
+    return 'Choose a question above to check the campus records available to your account.';
   }
 
-  return 'CampusFlow is designed to detect scheduling, facilities, and student-service risks early so the university can act before they affect daily operations.';
+  return 'Choose a question above to summarize the records available to your account.';
 }
 
 function QuickCard({ title, copy, icon, onClick }: { title: string; copy: string; icon: string; onClick: () => void }) {
@@ -555,61 +710,53 @@ function QuickCard({ title, copy, icon, onClick }: { title: string; copy: string
 }
 
 type ModulePageProps = {
-  user: DemoUser;
+  user: CampusUser;
   module: ModuleKey;
   tables: Record<ModuleKey, TableRow[]>;
   search: string;
   setSearch: (value: string) => void;
   resolveClash: () => void;
   progressTicket: () => void;
-  markAttendance: () => void;
-  payInvoice: () => void;
-  bookRoom: () => void;
   openDraft: (module: ModuleKey, title: string, hint: string, status?: string) => void;
-  updateRow: (module: ModuleKey, id: string, changes: Record<string, string>) => void;
+  updateRow: (module: ModuleKey, id: string, changes: Record<string, string>) => Promise<void>;
+  runAction: (action: () => Promise<void>) => Promise<void>;
   notify: (message: string) => void;
-  ownedComplaintIds: string[];
 };
 
 function ModulePage(props: ModulePageProps) {
-  const { user, module, tables, search, setSearch, openDraft, updateRow, notify, ownedComplaintIds } = props;
+  const { user, module, tables, search, setSearch, openDraft, updateRow, notify } = props;
   const definition = modules.find((item) => item.key === module)!;
   const rows = tables[module];
-  const headers = rows.length ? Object.keys(rows[0]).filter((key) => key !== 'id') : [];
+  const headers = rows.length ? Object.keys(rows[0]).filter((key) => key !== 'id') : moduleFields[module];
   const visibleRows = useMemo(() => rows.filter((row) => {
-    const isOwnComplaint = module !== 'complaints' || user.role !== 'student' || ownedComplaintIds.includes(row.id);
-    return isOwnComplaint && Object.values(row).join(' ').toLowerCase().includes(search.toLowerCase());
-  }), [rows, search, module, user.role, ownedComplaintIds]);
+    return Object.values(row).join(' ').toLowerCase().includes(search.toLowerCase());
+  }), [rows, search]);
 
   const action = module === 'timetable' && user.role === 'administrator'
     ? { label: 'Resolve detected clash', run: props.resolveClash }
     : module === 'maintenance'
-      ? { label: tables.maintenance.find((row) => row.id === 'm1')?.Status === 'Resolved' ? 'Projector resolved' : 'Progress Science 104 ticket', run: props.progressTicket }
-      : module === 'attendance' && user.role === 'staff'
-        ? { label: "Save today's register", run: props.markAttendance }
-        : module === 'finance' && user.role === 'student'
-          ? { label: 'Pay demo invoice', run: props.payInvoice }
-          : module === 'rooms' && user.role !== 'administrator' && tables.rooms.find((row) => row.id === 'r3')?.Status === 'Available'
-            ? { label: 'Book Library 2F', run: props.bookRoom }
-            : null;
+      ? { label: tables.maintenance.some((row) => row.Status !== 'Resolved') ? 'Progress maintenance ticket' : 'No open tickets', run: props.progressTicket }
+      : null;
 
   const canCreate = module === 'complaints'
     ? user.role === 'student'
-    : module !== 'rooms' && (user.role === 'administrator' || ['maintenance', 'requests', 'events', 'documents'].includes(module)) && !(module === 'finance' && user.role === 'student');
+    : user.role === 'administrator' && module !== 'analytics'
+      || user.role === 'staff' && ['attendance', 'maintenance', 'announcements', 'events', 'requests'].includes(module)
+      || user.role === 'student' && ['hostels', 'documents', 'requests'].includes(module);
   const createTitle = module === 'maintenance' ? 'Report issue' : module === 'requests' ? 'New service request' : module === 'complaints' ? 'Submit complaint' : module === 'finance' ? 'Create invoice' : module === 'rooms' ? 'New booking' : `Add ${definition.label.slice(0, -1) || 'record'}`;
 
-  const advanceRequest = (row: TableRow) => {
+  const advanceRequest = async (row: TableRow) => {
     const current = row.Status;
     const next = current === 'Submitted' ? 'Under review' : current === 'Under review' ? 'Approved' : current === 'Approved' ? 'Completed' : current;
-    updateRow(module, row.id, { Status: next });
+    await updateRow(module, row.id, { Status: next });
     notify(`Request moved to ${next.toLowerCase()}.`);
   };
 
-  const advanceComplaint = (row: TableRow) => {
+  const advanceComplaint = async (row: TableRow) => {
     const next = row.Status === 'Submitted' ? 'Under review' : row.Status === 'Under review' || row.Status === 'Escalated' ? 'Resolved' : row.Status;
     if (next === row.Status) return;
 
-    updateRow(module, row.id, { Status: next });
+    await updateRow(module, row.id, { Status: next });
     notify(next === 'Resolved' ? 'Complaint resolved. The reporter can see the updated status.' : 'Complaint moved to internal review.');
   };
 
@@ -622,7 +769,7 @@ function ModulePage(props: ModulePageProps) {
         </label>
 
         <div>
-          {action && <button className="secondary" onClick={action.run}>{action.label}</button>}
+          {action && <button className="secondary" onClick={() => { void props.runAction(async () => action.run()); }}>{action.label}</button>}
           {canCreate && (
             <button className="primary" onClick={() => openDraft(module, createTitle, `Add a record to ${definition.label}.`, module === 'maintenance' ? 'New' : 'Submitted')}>
               + {createTitle}
@@ -631,17 +778,17 @@ function ModulePage(props: ModulePageProps) {
         </div>
       </div>
 
-      {module === 'timetable' && <ConflictBanner onResolve={props.resolveClash} resolved={tables.timetable.find((row) => row.id === 't2')?.Status === 'Rescheduled'} />}
+      {module === 'timetable' && tables.timetable.some((row) => row.Status?.toLowerCase().includes('conflict')) && <ConflictBanner onResolve={props.resolveClash} resolved={false} />}
       {module === 'attendance' && user.role === 'student' && (
         <div className="insight-banner">
           <span>?</span>
           <div>
-            <b>You are on track.</b>
-            <p>Your attendance is 87% in CS210. The university support threshold is 75%.</p>
+            <b>Your attendance records</b>
+            <p>Only attendance records linked to your account are shown here.</p>
           </div>
         </div>
       )}
-      {module === 'analytics' && <Analytics />}
+      {module === 'analytics' && <Analytics tables={tables} />}
       {module === 'complaints' && (
         <div className="insight-banner">
           <span>i</span>
@@ -649,16 +796,16 @@ function ModulePage(props: ModulePageProps) {
             <b>{user.role === 'student' ? 'Private case tracking' : 'Identity-free review'}</b>
             <p>{user.role === 'student'
               ? 'Your reports appear here by case reference. No student ID or name is included in the report.'
-              : 'Reviewers see the report details and case reference only. This seeded demo does not collect reporter identity.'}</p>
+              : 'Reviewers see the report details and case reference only. Reporter identity is not stored with the complaint.'}</p>
           </div>
         </div>
       )}
-      {module === 'maintenance' && (
+      {module === 'maintenance' && tables.maintenance.some((row) => row.Status !== 'Resolved') && (
         <div className="insight-banner amber">
           <span>?</span>
           <div>
-            <b>High-priority room issue is being handled.</b>
-            <p>The Science 104 projector affects scheduled teaching. Facilities updates appear here in real time.</p>
+            <b>There are open maintenance records.</b>
+            <p>Status updates are saved to the campus database.</p>
           </div>
         </div>
       )}
@@ -669,7 +816,7 @@ function ModulePage(props: ModulePageProps) {
             <span className="eyebrow">{visibleRows.length} {visibleRows.length === 1 ? 'record' : 'records'}</span>
             <h2>{definition.label}</h2>
           </div>
-          <small>Use the status controls to demonstrate each workflow.</small>
+          <small>Changes are saved to the campus database.</small>
         </div>
 
         <div className="table-wrap">
@@ -694,16 +841,13 @@ function ModulePage(props: ModulePageProps) {
 
                     <td className="action-cell">
                       {module === 'requests' && user.role !== 'student' && (
-                        <button className="secondary tiny" onClick={() => advanceRequest(row)}>Advance</button>
+                        <button className="secondary tiny" onClick={() => { void props.runAction(() => advanceRequest(row)); }}>Advance</button>
                       )}
                       {module === 'complaints' && user.role !== 'student' && row.Status !== 'Resolved' && (
-                        <button className="secondary tiny" onClick={() => advanceComplaint(row)}>{row.Status === 'Submitted' ? 'Start review' : 'Resolve'}</button>
+                        <button className="secondary tiny" onClick={() => { void props.runAction(() => advanceComplaint(row)); }}>{row.Status === 'Submitted' ? 'Start review' : 'Resolve'}</button>
                       )}
                       {module === 'maintenance' && user.role === 'staff' && (
                         <button className="secondary tiny" onClick={props.progressTicket}>Update</button>
-                      )}
-                      {module === 'finance' && user.role === 'student' && (
-                        <button className="secondary tiny" onClick={props.payInvoice}>Pay</button>
                       )}
                     </td>
                   </tr>
@@ -732,7 +876,7 @@ function ConflictBanner({ onResolve, resolved }: { onResolve: () => void; resolv
       <span>?</span>
       <div>
         <b>Timetable conflict resolved.</b>
-        <p>CS240 now runs in Innovation Lab. Affected students received the updated schedule.</p>
+        <p>The timetable record has been updated.</p>
       </div>
     </div>
   ) : (
@@ -740,41 +884,113 @@ function ConflictBanner({ onResolve, resolved }: { onResolve: () => void; resolv
       <span>!</span>
       <div>
         <b>One scheduling conflict needs a decision.</b>
-        <p>Science 104 is double-booked Monday at 09:00. Innovation Lab is available.</p>
+        <p>Review the affected course and confirm an available replacement room.</p>
       </div>
-      <button className="secondary" onClick={onResolve}>Move CS240</button>
+      <button className="secondary" onClick={onResolve}>Resolve conflict</button>
     </div>
   );
 }
 
-function Analytics() {
+function Analytics({ tables }: { tables: Record<ModuleKey, TableRow[]> }) {
+  const attendanceRisk = tables.attendance.filter((row) => {
+    const percentage = Number(row.Percentage?.replace('%', ''));
+    return Number.isFinite(percentage) && percentage < 75;
+  }).length;
+  const paidInvoices = tables.finance.filter((row) => row.Status === 'Paid').length;
+  const invoiceCount = tables.finance.length;
+  const collection = invoiceCount ? Math.round((paidInvoices / invoiceCount) * 100) : null;
+
   return (
     <div className="analytics-strip">
       <div>
-        <span>Attendance risk</span>
-        <b>73 students</b>
-        <small>12 new this week</small>
+        <span>Attendance records below 75%</span>
+        <b>{attendanceRisk}</b>
+        <small>Based on records visible to this account</small>
       </div>
       <div>
-        <span>Room utilization</span>
-        <b>78%</b>
-        <small>? 6% this term</small>
+        <span>Room records</span>
+        <b>{tables.rooms.length}</b>
+        <small>Current records</small>
       </div>
       <div>
-        <span>Fee collection</span>
-        <b>91%</b>
-        <small>$84.2K outstanding</small>
+        <span>Invoices paid</span>
+        <b>{collection === null ? '—' : `${collection}%`}</b>
+        <small>{invoiceCount} invoice record{invoiceCount === 1 ? '' : 's'}</small>
       </div>
     </div>
   );
 }
 
-function DraftForm({ draft, name, status, setName, setStatus, category, priority, setCategory, setPriority, fields, values, setValues, onClose, onSubmit }: {
+function AccountForm({ account, setAccount, setupToken, setSetupToken, onClose, onSubmit }: {
+  account: AccountDraft;
+  setAccount: (account: AccountDraft) => void;
+  setupToken: string;
+  setSetupToken: (token: string) => void;
+  onClose: () => void;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  const update = (changes: Partial<AccountDraft>) => setAccount({ ...account, ...changes });
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <form className="modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}>
+        <button type="button" className="close" onClick={onClose} aria-label="Close">x</button>
+        <span className="eyebrow">User administration</span>
+        <h2>Create campus account</h2>
+        <p>Accounts are created on the server. The temporary setup token is not saved in the browser.</p>
+        <label>
+          Temporary setup token
+          <input required type="password" autoComplete="off" value={setupToken} onChange={(event) => setSetupToken(event.target.value)} />
+        </label>
+        <label>
+          Full name
+          <input required maxLength={160} value={account.name} onChange={(event) => update({ name: event.target.value })} />
+        </label>
+        <label>
+          University email
+          <input required type="email" maxLength={254} value={account.email} onChange={(event) => update({ email: event.target.value })} />
+        </label>
+        <label>
+          Temporary password (minimum 12 characters)
+          <input required type="password" minLength={12} maxLength={128} autoComplete="new-password" value={account.password} onChange={(event) => update({ password: event.target.value })} />
+        </label>
+        <label>
+          Role
+          <select value={account.role} onChange={(event) => update({ role: event.target.value as CampusUser['role'] })}>
+            <option value="student">Student</option>
+            <option value="staff">Faculty &amp; staff</option>
+            <option value="administrator">Administrator</option>
+          </select>
+        </label>
+        <label>
+          Department
+          <input maxLength={160} value={account.department} onChange={(event) => update({ department: event.target.value })} />
+        </label>
+        {account.role === 'student' && (
+          <label>
+            Programme
+            <input maxLength={160} value={account.programme} onChange={(event) => update({ programme: event.target.value })} />
+          </label>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="secondary" onClick={onClose}>Cancel</button>
+          <button className="primary" type="submit">Create account</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function DraftForm({ draft, name, status, setName, setStatus, ownerEmail, setOwnerEmail, canAssignOwner, ownerRequired, category, priority, setCategory, setPriority, fields, values, setValues, onClose, onSubmit }: {
   draft: NonNullable<DraftModal>;
   name: string;
   status: string;
   setName: (value: string) => void;
   setStatus: (value: string) => void;
+  ownerEmail: string;
+  setOwnerEmail: (value: string) => void;
+  canAssignOwner: boolean;
+  ownerRequired: boolean;
   category: string;
   priority: string;
   setCategory: (value: string) => void;
@@ -792,6 +1008,13 @@ function DraftForm({ draft, name, status, setName, setStatus, category, priority
         <span className="eyebrow">CampusFlow workflow</span>
         <h2>{draft.title}</h2>
         <p>{draft.hint}</p>
+
+        {canAssignOwner && (
+          <label>
+            Link to student account (email)
+            <input required={ownerRequired} type="email" value={ownerEmail} onChange={(event) => setOwnerEmail(event.target.value)} placeholder="student@university.edu" />
+          </label>
+        )}
 
         {draft.module === 'complaints' ? (
           <>
@@ -828,18 +1051,25 @@ function DraftForm({ draft, name, status, setName, setStatus, category, priority
             {fields.slice(1).map((field) => (
               <label key={field}>
                 {field}
-                <input required value={values[field] ?? ''} onChange={(event) => setValues({ ...values, [field]: event.target.value })} placeholder={`Enter ${field.toLowerCase()}`} />
+                <input
+                  required={!['Status', 'Decision', 'Signal', 'Availability', 'Change'].includes(field)}
+                  value={values[field] ?? ''}
+                  onChange={(event) => setValues({ ...values, [field]: event.target.value })}
+                  placeholder={`Enter ${field.toLowerCase()}`}
+                />
               </label>
             ))}
-            <label>
-              Starting status
-              <select value={status} onChange={(event) => setStatus(event.target.value)}>
-                <option>Submitted</option>
-                <option>New</option>
-                <option>Pending</option>
-                <option>Under review</option>
-              </select>
-            </label>
+            {moduleFields[draft.module].includes('Status') && (
+              <label>
+                Starting status
+                <select value={status} onChange={(event) => setStatus(event.target.value)}>
+                  <option>Submitted</option>
+                  <option>New</option>
+                  <option>Pending</option>
+                  <option>Under review</option>
+                </select>
+              </label>
+            )}
           </>
         )}
 
