@@ -29,3 +29,5 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      - key: USER_PROVISIONING_TOKEN
+        sync: false
